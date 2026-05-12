@@ -1,0 +1,9 @@
+#%PAM-1.0
+# Fingerprint first, fallback to password — no lockout on fingerprint timeout
+auth       sufficient    pam_fprintd.so
+auth       required      pam_faillock.so preauth
+auth       sufficient    pam_unix.so try_first_pass nullok
+auth       [default=die] pam_faillock.so authfail
+auth       optional      pam_faillock.so authsucc
+account    include       system-auth
+session    include       system-auth

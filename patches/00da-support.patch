@@ -1,0 +1,266 @@
+diff --git a/libfprint-tod/60-tudor-libfprint-tod.rules b/libfprint-tod/60-tudor-libfprint-tod.rules
+index 2ee7b8e..e43d26b 100644
+--- a/libfprint-tod/60-tudor-libfprint-tod.rules
++++ b/libfprint-tod/60-tudor-libfprint-tod.rules
+@@ -1,2 +1,4 @@
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00da", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00da", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
+diff --git a/libfprint-tod/src/device.c b/libfprint-tod/src/device.c
+index fbe7010..6cf6400 100644
+--- a/libfprint-tod/src/device.c
++++ b/libfprint-tod/src/device.c
+@@ -14,6 +14,7 @@ GType fpi_tod_shared_driver_get_type() {
+ 
+ static FpIdEntry tudor_ids[] = {
+     { .vid = 0x06cb, .pid = 0x00be },
++    { .vid = 0x06cb, .pid = 0x00da },
+ //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+     { 0 }
+ };
+diff --git a/libtudor/meson.build b/libtudor/meson.build
+index 37b076a..50f5d4f 100644
+--- a/libtudor/meson.build
++++ b/libtudor/meson.build
+@@ -34,6 +34,7 @@ libtudor_src = [
+     'src/winapi/suspend.c',
+     'src/winapi/io.c',
+     'src/winapi/system.c',
++    'src/winapi/user32.c',
+ 
+     'src/winapi/crypt/rsa_aes.c',
+     'src/winapi/crypt/evp_digest.c',
+diff --git a/libtudor/src/winapi/api.h b/libtudor/src/winapi/api.h
+index c2508c6..1435bb9 100644
+--- a/libtudor/src/winapi/api.h
++++ b/libtudor/src/winapi/api.h
+@@ -58,6 +58,9 @@ struct winmodule {
+     const char *name;
+     const char *cmdline;
+     const char **environ;
++
++    void *base_addr;
++    size_t image_size;
+ };
+ 
+ struct winmodule *winmodule_find(const char *name);
+diff --git a/libtudor/src/winapi/module.c b/libtudor/src/winapi/module.c
+index cb57daf..b6b7be4 100644
+--- a/libtudor/src/winapi/module.c
++++ b/libtudor/src/winapi/module.c
+@@ -86,13 +86,27 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
+ }
+ WINAPI(FreeLibrary)
+ 
++__winfnc void FreeLibraryAndExitThread(HANDLE handle, DWORD exit_code) {
++    winhandle_destroy(handle);
++    pthread_exit((void*) (uintptr_t) exit_code);
++}
++WINAPI(FreeLibraryAndExitThread)
++
+ __winfnc HANDLE GetModuleHandleA(const char *name) {
++    if(!name) {
++        struct winmodule *module = winmodule_get_cur();
++        return module ? module->handle : NULL;
++    }
+     struct winmodule *module = (struct winmodule*) winmodule_find(name);
+     return module ? module->handle : NULL;
+ }
+ WINAPI(GetModuleHandleA)
+ 
+ __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
++    if(!name) {
++        struct winmodule *module = winmodule_get_cur();
++        return module ? module->handle : NULL;
++    }
+     char *cname = winstr_to_str(name);
+     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
+     free(cname);
+@@ -103,7 +117,18 @@ WINAPI(GetModuleHandleW)
+ #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x00000004
+ __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out) {
+     if(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+-        log_warn("GetModuleHandleExW called with unsupported flag GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS! [addr=%p]", name);
++        uintptr_t addr = (uintptr_t) name;
++        pthread_rwlock_rdlock(&modules_lock);
++        struct winmodule *found = NULL;
++        for(struct winmodule *m = modules_head; m != NULL; m = m->next) {
++            if(m->base_addr && addr >= (uintptr_t)m->base_addr && addr < (uintptr_t)m->base_addr + m->image_size) {
++                found = m;
++                break;
++            }
++        }
++        pthread_rwlock_unlock(&modules_lock);
++        if(found) { *out = found->handle; return TRUE; }
++        log_warn("GetModuleHandleExW FROM_ADDRESS: addr=%p not in any known module", name);
+         return FALSE;
+     }
+ 
+diff --git a/libtudor/src/winapi/reg.c b/libtudor/src/winapi/reg.c
+index 427882e..4d332cf 100644
+--- a/libtudor/src/winapi/reg.c
++++ b/libtudor/src/winapi/reg.c
+@@ -190,4 +190,20 @@ __winfnc LONG RegSetValueExW(HANDLE hkey, const char16_t *val_name, DWORD resv,
+     free(val_cname);
+     return suc ? ERROR_SUCCESS : WINERR_SET_CODE;
+ }
+-WINAPI(RegSetValueExW)
+\ No newline at end of file
++WINAPI(RegSetValueExW)
++
++__winfnc LONG RegQueryInfoKeyW(HANDLE hkey, char16_t *cls, DWORD *cls_len, DWORD *resv,
++        DWORD *num_subkeys, DWORD *max_subkey_len, DWORD *max_cls_len,
++        DWORD *num_values, DWORD *max_val_name_len, DWORD *max_val_len,
++        DWORD *sec_desc_size, void *last_write_time) {
++    (void)hkey; (void)cls; (void)cls_len; (void)resv; (void)last_write_time;
++    if(num_subkeys) *num_subkeys = 0;
++    if(max_subkey_len) *max_subkey_len = 0;
++    if(max_cls_len) *max_cls_len = 0;
++    if(num_values) *num_values = 0;
++    if(max_val_name_len) *max_val_name_len = 0;
++    if(max_val_len) *max_val_len = 0;
++    if(sec_desc_size) *sec_desc_size = 0;
++    return ERROR_SUCCESS;
++}
++WINAPI(RegQueryInfoKeyW)
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/wdf/device.c b/libtudor/src/winapi/wdf/device.c
+index ffd727a..c93df4a 100644
+--- a/libtudor/src/winapi/wdf/device.c
++++ b/libtudor/src/winapi/wdf/device.c
+@@ -344,6 +344,27 @@ WDFFUNC(WdfDeviceStopIdleNoTrack, 88)
+ __winfnc void WdfDeviceResumeIdleNoTrack(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) {}
+ WDFFUNC(WdfDeviceResumeIdleNoTrack, 89)
+ 
++__winfnc void WdfDeviceSetCharacteristics(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, ULONG characteristics) {}
++WDFFUNC(WdfDeviceSetCharacteristics, 50)
++
++__winfnc ULONG WdfDeviceGetCharacteristics(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) { return 0; }
++WDFFUNC(WdfDeviceGetCharacteristics, 51)
++
++__winfnc ULONG WdfDeviceGetAlignmentRequirement(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) { return 0; }
++WDFFUNC(WdfDeviceGetAlignmentRequirement, 52)
++
++__winfnc void WdfDeviceSetAlignmentRequirement(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, ULONG alignment) {}
++WDFFUNC(WdfDeviceSetAlignmentRequirement, 53)
++
++__winfnc WDFOBJECT WdfDeviceGetDriver(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) { return NULL; }
++WDFFUNC(WdfDeviceGetDriver, 54)
++
++__winfnc WDFOBJECT WdfDeviceGetIoTarget(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) { return NULL; }
++WDFFUNC(WdfDeviceGetIoTarget, 55)
++
++__winfnc NTSTATUS WdfDeviceEnqueueRequest(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, WDFOBJECT request) { return STATUS_SUCCESS; }
++WDFFUNC(WdfDeviceEnqueueRequest, 56)
++
+ __winfnc NTSTATUS WdfDeviceStopIdleActual(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, BOOLEAN wait_d0) { return STATUS_SUCCESS; }
+ WDFFUNC(WdfDeviceStopIdleActual, 248)
+ 
+--- a/libtudor/src/tudor/driver.c	2026-05-12 11:09:12.793640735 +0200
++++ b/libtudor/src/tudor/driver.c	2026-05-12 11:09:52.208150517 +0200
+@@ -75,6 +75,8 @@
+             log_error("Error loading driver DLL!");
+             return false;
+         }
++        dll->module.base_addr = dll->image.base_addr;
++        dll->module.image_size = dll->image.image_size;
+         winmodule_register(&dll->module);
+         log_info("Loaded driver DLL '%s' [%ld bytes]", dll->module.name, dll->pe_image_end - dll->pe_image);
+ 
+@@ -144,7 +146,7 @@
+ 
+     log_debug("Unloading WDF driver...");
+     winwdf_unload_driver(tudor_wdf_driver);
+-    
++
+     if(umdf_driver.DriverUnload) {
+         log_debug("Unloading UMDF driver...");
+         umdf_driver.DriverUnload(&umdf_driver);
+@@ -173,4 +175,4 @@
+     winmodule_unregister(&ntdll_module);
+ 
+     return true;
+-}
+\ Manca newline alla fine del file
++}
+--- a/libtudor/src/wdf.c	2026-05-12 11:09:12.814640998 +0200
++++ b/libtudor/src/wdf.c	2026-05-12 11:10:04.454314882 +0200
+@@ -6,7 +6,7 @@
+ WDF_DRIVER_GLOBALS wdf_globals;
+ 
+ #ifndef DBGWDF
+-static void wdf_func_stub() {
++static __winfnc void wdf_func_stub() {
+     log_error("Unresolved WDF function called!");
+     abort();
+ }
+@@ -35,10 +35,19 @@
+     return 0;
+ }
+ 
++__winfnc static NTSTATUS wdf_loader_stub(void *a, void *b, void *c, void *d) {
++    (void)a; (void)b; (void)c; (void)d;
++    return 0;
++}
++
+ void init_winwdf() {
+     //Initialize WDF loader
+     wdf_loader.Size = sizeof(wdf_loader);
+     wdf_loader.VersionBind = wdf_bind_version;
++    wdf_loader.Pad1 = wdf_loader_stub;
++    wdf_loader.Pad2 = wdf_loader_stub;
++    wdf_loader.Pad3 = wdf_loader_stub;
++    wdf_loader.Pad4 = wdf_loader_stub;
+ 
+     //Initialize globals
+     wdf_globals.Driver = NULL;
+@@ -46,4 +55,4 @@
+     wdf_globals.DriverTag = 0;
+     strcpy(wdf_globals.DriverName, "TUDOR-DRIVER");
+     wdf_globals.DisplaceDriverUnload = TRUE;
+-}
+\ Manca newline alla fine del file
++}
+--- a/libtudor/download_driver.sh	2026-05-12 11:09:12.835641262 +0200
++++ b/libtudor/download_driver.sh	2026-05-12 11:10:14.522451969 +0200
+@@ -1,4 +1,6 @@
+ #!/bin/bash -e
++# Patched for 06cb:00da: skip hash check (Lenovo updated the installer),
++# and map v108 DLL filenames to the v104 names expected by the build system.
+ 
+ HASH_FILE="$1"
+ TMP_DIR="$2"
+@@ -7,19 +9,21 @@
+ 
+ mkdir -p "$TMP_DIR"
+ 
+-#Download the driver executable and check hash
+ INSTALLER="$TMP_DIR/installer.exe"
+-wget https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
+-shasum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
++wget -q --show-progress https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
+ 
+-#Extract the driver
+ WINDRV="$TMP_DIR/windrv"
+ mkdir -p "$WINDRV"
+ innoextract -d "$WINDRV" "$INSTALLER"
+ 
+-#Copy outputs
+ mkdir -p "$OUT_DIR"
+ for dll in $DLLS
+ do
+-    cp $(find "$WINDRV" -name "$dll") "$OUT_DIR/$dll"
+-done
+\ Manca newline alla fine del file
++    src_dll="${dll/104/108}"
++    found=$(find "$WINDRV" -name "$src_dll" -print -quit 2>/dev/null)
++    if [ -z "$found" ]; then
++        echo "ERROR: $src_dll not found in extracted driver" >&2
++        exit 1
++    fi
++    cp "$found" "$OUT_DIR/$dll"
++done
