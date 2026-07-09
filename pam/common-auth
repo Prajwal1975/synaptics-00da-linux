@@ -1,0 +1,7 @@
+#%PAM-1.0
+# Ubuntu: fingerprint first, password as fallback
+auth    [success=2 default=ignore]    /usr/lib/x86_64-linux-gnu/security/pam_fprintd.so timeout=10 max_tries=1
+auth    [success=1 default=ignore]    pam_unix.so nullok try_first_pass
+auth    requisite                     pam_deny.so
+auth    required                      pam_permit.so
+auth    optional                      pam_cap.so
